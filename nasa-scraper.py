@@ -20,6 +20,7 @@ import sys, getopt
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import configparser
+import threading
 
 # Cette fonction vérifie si date début <= date <= date fin
 def date_in_range(date, dd, df):
@@ -49,62 +50,125 @@ def get_liens_articles(archive_photos):
                     liste_articles.append('https://apod.nasa.gov/apod/'+link)
     return liste_articles
 
+def decouper_liste_threads(liste_images, nb_threads):
+    q = len(liste_images)//nb_threads
+    images = []
+    for i in range(nb_threads-1):
+        a = i*q
+        b = a + q
+        images.append(liste_images[a:b])
+    a = q*(nb_threads-1)
+    images.append(liste_images[a:])
+    return images
+
 # Récupère la liste des : lien pour télécharger l'image, le nom de l'image, et la date de l'image
-def get_liens_images(liste_articles, session):
+def get_liens_images(liste_articles, session, result, index):
     liste_images = []
-    liste_refus = []
+    liste_refus = []   
     for lien in liste_articles:
         nom, lien_img, date = get_lien_image(lien, session)
         if lien_img is not None:
             liste_images.append((nom, lien_img, date))
         else:
             liste_refus.append(lien)
+    result[index] = (liste_images, liste_refus)
+
+def threading_liens_images(nb_threads, articles, session):
+    articles = decouper_liste_threads(liste_articles, nb_threads)
+    
+    threads = [None]*nb_threads
+    results = [None]*nb_threads
+    for i in range(len(threads)):
+        threads[i] = threading.Thread(target=get_liens_images, args=(articles[i], session, results, i))
+        threads[i].start()
+    
+    liste_images = []
+    liste_refus = []  
+    for i in range(len(threads)):
+        threads[i].join()
+        liste_images += results[i][0]
+        liste_refus += results[i][1] 
     return liste_images, liste_refus
 
 # Récupère 1 triplet d'informations à partir de l'url de l'article
 
+def get_iframe(lien, session):
+    l = session.get(lien).text
+    souplien = BeautifulSoup(l, 'html.parser')
+    lien_iframe = souplien.find('iframe')
+    if lien_iframe is not None:
+        lien_iframe = lien_iframe.get('src')
+    return lien_iframe
+
+def get_image_from_iframe(lien_iframe, session):
+    if lien_iframe is not None:
+        l = session.get(lien_iframe).text
+        souplien = BeautifulSoup(l, 'html.parser')
+        lien_img = souplien.find('img')
+        nom = ''
+        if lien_img is not None:
+            lien_img = lien_img.get('src')
+            if lien_img is not None:
+                lien_iframe = "/".join(lien_iframe.split('/')[:-1])
+                nom = lien_img
+                lien_img = lien_iframe+"/"+lien_img
+            else:
+                lien_img = None
+        return nom, lien_img
+
 def get_lien_image(lien, session):
     l = session.get(lien).text
     souplien = BeautifulSoup(l, 'html.parser')
-    lien_img = souplien.find('img')
+    liste_lien_img = souplien.findAll('a')
     nom = ''
-    date = None
-    if lien_img is not None:
-        lien_img = lien_img.get('src')
-        if lien_img.startswith('image'):
+    date = lien.split('/')[-1:][0].replace('ap','').replace('.html','')
+    img_trouvee = False
+    for li in liste_lien_img:
+        lien_img = li.get('href')
+        if lien_img is not None and lien_img.startswith('image'):
             lien_img = 'https://apod.nasa.gov/apod/'+lien_img
             nom = lien_img.split('/')[-1:][0]
-            date = lien.split('/')[-1:][0].replace('ap','').replace('.html','')
-        else:
-            lien_img = None
+            img_trouvee = True
+            break
+    if not img_trouvee:
+        lien_iframe = get_iframe(lien, session)
+        if lien_iframe is not None:
+            nom, lien_img = get_image_from_iframe(lien_iframe, session)
     return nom, lien_img, date
 
 # Télécharge toutes les images de la liste
-def telecharger_images(liste_images, session):
+def telecharger_images(liste_images, session, result, index):
     liste_fail = []
     if liste_images != []:
         total_images = len(liste_images)
         cpt = 0
         for nom,lien,date in liste_images:
             cpt += 1
-            telecharger_image(nom,lien,date, cpt, total_images, session, liste_fail)
-    return liste_fail
+            telecharger_image(nom,lien,date, cpt, total_images, session, liste_fail, index)
+    result[index] = liste_fail
 
 # Télécharge une image
-def telecharger_image(nom,lien,date, cpt, total_images, session, liste_fail):
+def telecharger_image(nom,lien,date, cpt, total_images, session, liste_fail, index):
     try:
         r = session.get(lien, stream=True)
         if r.status_code == 200:
             with open(os.path.join(save_folder, date+"_"+nom), 'wb') as f:
                 r.raw.decode_content = True
                 shutil.copyfileobj(r.raw, f)
-                print("   ("+str(cpt)+"/"+str(total_images)+") Téléportation de l'IA "+date+"_"+nom+" confirmée.")
+                print("   Tuyère "+str(index)+" ("+str(cpt)+"/"+str(total_images)+") Téléportation de l'IA "+date+"_"+nom+" confirmée.")
                 print("      Source du transfert : "+lien)
     except Exception:
         print('   ('+str(cpt)+"/"+str(total_images)+') IA '+date+"_"+nom+" corrompue.")
         print("      Abandon du transfert : "+lien)
         liste_fail.append((date+"_"+nom, lien))
-
+        
+def isInt(s):
+    try: 
+        int(s)
+        return True
+    except ValueError:
+        return False
+    
 # Récupération des arguments de la ligne de commande
 def recuperer_arguments(argv):
     global date_debut_batch
@@ -162,14 +226,21 @@ def init_session():
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     return session
-
+ 
 def chargement_config():
     config = configparser.ConfigParser()
     config.read('config.ini')
     date_debut_batch = None
     date_fin_batch = None
+    nb_threads = None
     save_dir = './images'
     if 'DEFAULT' in config:
+        if 'nb_threads' in config['DEFAULT']:
+            nb_threads = config['DEFAULT']['nb_threads']
+            if nb_threads is None or not isInt(nb_threads) or int(nb_threads) < 1:
+                nb_threads = 1
+            else:
+                nb_threads = int(nb_threads)
         if 'date_debut_batch' in config['DEFAULT']:
             date_debut_batch = config['DEFAULT']['date_debut_batch']
             if date_debut_batch == '' or date_debut_batch == 'None':
@@ -182,7 +253,7 @@ def chargement_config():
             save_dir = config['DEFAULT']['save_dir']
             assert save_dir is not None
             assert save_dir != ''
-    return config, date_debut_batch, date_fin_batch, save_dir
+    return config, date_debut_batch, date_fin_batch, save_dir, nb_threads
 
 def sauver_config(config, date_fin_batch):
     now = datetime.datetime.now()
@@ -195,7 +266,7 @@ def sauver_config(config, date_fin_batch):
         config.write(configfile)
 
 def sauvegarder_log(date_debut_batch, date_fin_batch, liste_articles, liste_images, liste_refus, liste_fail):
-    with open('batch.log', 'a') as logs:
+    with open('batch_'+str(date_debut_batch)+"_"+str(date_fin_batch)+'.log', 'a') as logs:
         logs.write("[Batch du "+str(date_debut_batch)+" au "+str(date_fin_batch)+"]\n["+str(len(liste_articles))+" images détectées]\n")
         logs.write("\n[Images traitées : "+str(len(liste_images))+"]\n")
         for item in liste_images:
@@ -208,10 +279,23 @@ def sauvegarder_log(date_debut_batch, date_fin_batch, liste_articles, liste_imag
             logs.write("%s\n" % (str(item[0])+" - "+str(item[1])))
         logs.write("\n")
 
+def threading_telechargements(nb_threads, images, session):
+    threads = [None]*nb_threads
+    results = [None]*nb_threads
+    for i in range(len(threads)):
+        threads[i] = threading.Thread(target=telecharger_images, args=(images[i], session, results, i))
+        threads[i].start()
+    
+    liste_fail = []
+    for i in range(len(threads)):
+        threads[i].join()
+        liste_fail += results[i]
+    return liste_fail
+
 if __name__ == '__main__':
     print("Chargement des modules de décollage...")
     # Configuration
-    config, date_debut_batch, date_fin_batch, save_folder = chargement_config()
+    config, date_debut_batch, date_fin_batch, save_folder, nb_threads = chargement_config()
     maj = False
     # Récupération des paramètres de la cmd
     recuperer_arguments(sys.argv[1:])
@@ -231,15 +315,17 @@ if __name__ == '__main__':
     print("   Land rover embarqué.")
     
     print("Validation du plan de vol...")
+
     liste_articles = get_liens_articles(archive_photos)
     print("  ",len(liste_articles),"documents détectés.")
     
     print("Vérification des modules d'amarrage...")
-    liste_images, liste_refus = get_liens_images(liste_articles, session)
+    liste_images, liste_refus = threading_liens_images(nb_threads, liste_articles, session)
     print("  ",len(liste_images)," ancres connectées au système central.")
     
     print("Contournement du pare-feu et surcharge du réacteur principal...")
-    liste_fail = telecharger_images(liste_images, session)
+    images = decouper_liste_threads(liste_images, nb_threads)
+    liste_fail = threading_telechargements(nb_threads, images, session)
     
     print(str(len(liste_refus))," intrus détectés.")
     sauvegarder_log(date_debut_batch, date_fin_batch, liste_articles, liste_images, liste_refus, liste_fail)
