@@ -21,6 +21,10 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import configparser
 import threading
+import duplicateremover as dr
+import threadsutils as tu
+
+IFRAME_IGNORE = ['youtube','vimeo']
 
 # Cette fonction vérifie si date début <= date <= date fin
 def date_in_range(date, dd, df):
@@ -35,7 +39,13 @@ def date_in_range(date, dd, df):
             if df < date:
                 return False
     return True
-          
+  
+def str_contains(strli, sentence):
+    for s in strli:
+        if s in sentence:
+            return True
+    return False
+
 # Récupère le lien pour aller sur chaque article (compris entre les dates demandées)      
 def get_liens_articles(archive_photos):
     global date_debut_batch
@@ -50,17 +60,6 @@ def get_liens_articles(archive_photos):
                     liste_articles.append('https://apod.nasa.gov/apod/'+link)
     return liste_articles
 
-def decouper_liste_threads(liste_images, nb_threads):
-    q = len(liste_images)//nb_threads
-    images = []
-    for i in range(nb_threads-1):
-        a = i*q
-        b = a + q
-        images.append(liste_images[a:b])
-    a = q*(nb_threads-1)
-    images.append(liste_images[a:])
-    return images
-
 # Récupère la liste des : lien pour télécharger l'image, le nom de l'image, et la date de l'image
 def get_liens_images(liste_articles, session, result, index):
     liste_images = []
@@ -74,7 +73,7 @@ def get_liens_images(liste_articles, session, result, index):
     result[index] = (liste_images, liste_refus)
 
 def threading_liens_images(nb_threads, articles, session):
-    articles = decouper_liste_threads(liste_articles, nb_threads)
+    articles = tu.decouper_liste_threads(liste_articles, nb_threads)
     
     threads = [None]*nb_threads
     results = [None]*nb_threads
@@ -91,13 +90,14 @@ def threading_liens_images(nb_threads, articles, session):
     return liste_images, liste_refus
 
 # Récupère 1 triplet d'informations à partir de l'url de l'article
-
 def get_iframe(lien, session):
     l = session.get(lien).text
     souplien = BeautifulSoup(l, 'html.parser')
     lien_iframe = souplien.find('iframe')
     if lien_iframe is not None:
         lien_iframe = lien_iframe.get('src')
+        if str_contains(IFRAME_IGNORE, lien_iframe):
+            lien_iframe = None
     return lien_iframe
 
 def get_image_from_iframe(lien_iframe, session):
@@ -131,6 +131,7 @@ def get_lien_image(lien, session):
             img_trouvee = True
             break
     if not img_trouvee:
+        lien_img = None
         lien_iframe = get_iframe(lien, session)
         if lien_iframe is not None:
             nom, lien_img = get_image_from_iframe(lien_iframe, session)
@@ -157,6 +158,8 @@ def telecharger_image(nom,lien,date, cpt, total_images, session, liste_fail, ind
                 shutil.copyfileobj(r.raw, f)
                 print("   Tuyère "+str(index)+" ("+str(cpt)+"/"+str(total_images)+") Téléportation de l'IA "+date+"_"+nom+" confirmée.")
                 print("      Source du transfert : "+lien)
+        else:
+            raise Exception("Code retour différent de 200")
     except Exception:
         print('   ('+str(cpt)+"/"+str(total_images)+') IA '+date+"_"+nom+" corrompue.")
         print("      Abandon du transfert : "+lien)
@@ -265,7 +268,7 @@ def sauver_config(config, date_fin_batch):
     with open('config.ini', 'w') as configfile:
         config.write(configfile)
 
-def sauvegarder_log(date_debut_batch, date_fin_batch, liste_articles, liste_images, liste_refus, liste_fail):
+def sauvegarder_log(date_debut_batch, date_fin_batch, liste_articles, liste_images, liste_refus, liste_fail, liste_suppression):
     with open('batch_'+str(date_debut_batch)+"_"+str(date_fin_batch)+'.log', 'a') as logs:
         logs.write("[Batch du "+str(date_debut_batch)+" au "+str(date_fin_batch)+"]\n["+str(len(liste_articles))+" images détectées]\n")
         logs.write("\n[Images traitées : "+str(len(liste_images))+"]\n")
@@ -277,6 +280,10 @@ def sauvegarder_log(date_debut_batch, date_fin_batch, liste_articles, liste_imag
         logs.write("\n[Images échouées : "+str(len(liste_fail))+"]\n")
         for item in liste_fail:
             logs.write("%s\n" % (str(item[0])+" - "+str(item[1])))
+        logs.write("\n[Images supprimées : "+str(len(liste_suppression))+"]\n")
+        for item in liste_suppression:
+            logs.write("%s\n" % item)    
+        liste_suppression
         logs.write("\n")
 
 def threading_telechargements(nb_threads, images, session):
@@ -300,7 +307,9 @@ if __name__ == '__main__':
     # Récupération des paramètres de la cmd
     recuperer_arguments(sys.argv[1:])
     print("  Plan de vol du "+str(date_debut_batch)+" au "+str(date_fin_batch)+" validé.")
-    print("  Backup de la cartographie interstellaire dans le sas "+str(save_folder))
+    print("  Backup de la cartographie interstellaire dans le sas "+str(save_folder)+"...")
+    dic_sign_md5 = dr.generate_or_load_md5(save_folder)
+    print("     Découpage en parsec terminé")
 
     # Variables
     print("Connexion à la base de données universelle...")
@@ -324,11 +333,19 @@ if __name__ == '__main__':
     print("  ",len(liste_images)," ancres connectées au système central.")
     
     print("Contournement du pare-feu et surcharge du réacteur principal...")
-    images = decouper_liste_threads(liste_images, nb_threads)
+    images = tu.decouper_liste_threads(liste_images, nb_threads)
     liste_fail = threading_telechargements(nb_threads, images, session)
     
-    print(str(len(liste_refus))," intrus détectés.")
-    sauvegarder_log(date_debut_batch, date_fin_batch, liste_articles, liste_images, liste_refus, liste_fail)
+    print("   Annihilation des résidus de transfert...")
+    liste_suppression, dic_sign_md5 = dr.find_duplicates_folder(dic_sign_md5, save_folder)
+    for el in liste_suppression:
+        print("      Fret "+el+" largué.")
+    
+    print("   Ouverture d'un trou de ver...")
+    dr.save_dico_md5(dic_sign_md5)
+    
+    print(str(len(liste_refus))," intrus détectés. Veuillez monter sur le pont de toute urgence.")
+    sauvegarder_log(date_debut_batch, date_fin_batch, liste_articles, liste_images, liste_refus, liste_fail, liste_suppression)
     print("   Menaces erradiquées, reprise du protocole d'initialisation.")
     
     print("Systèmes principaux      : 100%")
