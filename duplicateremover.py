@@ -62,7 +62,7 @@ def generate_md5_folder(dossier):
     return dict_md5
 
 def generate_or_load_md5(dossier):
-    liste_fichiers = os.listdir(dossier)
+    liste_fichiers = os.listdir()
     if FICHIER_MD5_SIGNATURES in liste_fichiers:
         return load_dico_md5()
     else:
